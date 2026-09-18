@@ -1,7 +1,9 @@
 # MemoryBank — Multi-Agent Coordination MCP
 
-> 项目定位：基于 Cloudflare Workers + Durable Objects 的轻量级 Multi-Agent Coordination MCP。  
+> 项目定位：基于 Cloudflare Workers + Durable Objects 的轻量级 Multi-Agent Coordination MCP。
 > 目标：在单个 Project 内，让多个独立运行的 Agent 通过一个 Orchestrator 实现低冲突、即时、一致、可追踪的协作。
+> 本文保存长期背景和架构原则；具体 MVP 验收规则以 `specs/SPEC.md` 及 `specs/DECISIONS.md` 为准。
+> 当前可运行 MVP 按 ADR-009 收敛为 11 个 MCP 工具；本文后续完整模型和工具列表是演进方向，不是本版交付清单。
 
 ---
 
@@ -1032,7 +1034,7 @@ durable-objects/
 只有 Orchestrator 可以分配和重新分配任务。
 
 ### INV-004
-Submission approved 后，Orchestrator 才能将 Task 设置为 completed。
+Orchestrator 批准 Submission 时，ProjectDO 在同一事务中将 Task 设置为 completed；有 Worker Submission 的 Task 不得绕过审核完成。
 
 ### INV-005
 普通 Agent 不能批准自己的 Submission。
@@ -1134,7 +1136,13 @@ Domain Error
 
 ---
 
-### P1 — ProjectDO
+### P1 — Tests
+
+先验证领域权限、状态机、Submission、依赖、版本和身份边界。
+
+---
+
+### P2 — ProjectDO
 
 完成：
 
@@ -1149,23 +1157,9 @@ event append
 
 ---
 
-### P2 — Worker / MCP
+### P3 — Worker / MCP
 
 将领域能力映射成 MCP tools。
-
----
-
-### P3 — Tests
-
-重点测试：
-
-```text
-权限
-状态机
-version conflict
-submission flow
-dependency
-```
 
 ---
 

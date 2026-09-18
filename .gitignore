@@ -1,1 +1,5 @@
 cf-mcp-agentcooperateboard.code-workspace
+node_modules/
+.npm-cache/
+.wrangler/
+coverage/

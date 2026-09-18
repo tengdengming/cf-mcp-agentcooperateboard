@@ -1,0 +1,10 @@
+{
+  "name": "agent-coordination-mcp",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-09-18",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "PROJECTS", "class_name": "ProjectDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectDO"] }]
+}

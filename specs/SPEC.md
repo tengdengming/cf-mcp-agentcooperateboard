@@ -1,137 +1,64 @@
-# SPEC — Multi-Agent Coordination MCP
+# SPEC — Coordination MCP MVP
 
-## Status
+## 目标与范围
 
-Draft / MVP
+在 Cloudflare Worker 暴露一个 Streamable HTTP MCP 入口；每个 `project_id` 映射一个 SQLite-backed Project Durable Object。一个 Project 只有一个 Orchestrator，少于 10 个 Worker Agent。ProjectDO 保存 Agent、Task、Submission 和 Event 的当前状态；Worker 只负责协议适配和路由。领域规则使用纯 TypeScript，不能依赖 Cloudflare API。
 
-## Goal
+本版面向可信 Agent 的协作验证。`agent_id` 由工具参数传入，ProjectDO 根据已登记角色检查操作，但暂不实现凭据、身份防伪或公网访问控制。部署到不可信网络前必须补齐这部分。ADR-007 的凭据设计暂缓，ADR-009 定义本版范围。
 
-构建一个基于 Cloudflare Workers + Durable Objects 的 MCP 服务，使单个 Project 中少量独立 Agent 能在唯一 Orchestrator 的组织下协作。
+## 十一个 MCP 工具
 
-Agent 可以运行在不同机器和 Harness 中；协作通过 MCP 语义接口进行，不要求共享进程或底层存储。MVP 只管理项目内的即时协作状态，不管理长期知识或代码产物。
+所有工具包含 `project_id`。调用者相关工具还包含 `agent_id`。失败返回包含稳定 `code` 和 `message` 的 MCP Tool Error。所有 ID 为非空字符串，`progress` 为 0–100 的整数。
 
-## Actors
+| 工具 | 调用方 | 核心输入 | 核心返回与效果 |
+| --- | --- | --- | --- |
+| `project_init` | Orchestrator | `project_id`, `agent_id` | 创建 Project，指定唯一 Orchestrator；相同 ID 重试返回现有项目，其他 ID 不得取代 |
+| `agent_register` | Orchestrator 或 Worker | `project_id`, `agent_id`, `role` | 登记 Agent；Orchestrator 只能是项目指定 ID；已有同角色 Agent 重试返回现有记录 |
+| `agent_heartbeat` | 已登记 Agent | `project_id`, `agent_id`, `status`, `current_task_id?` | 更新自身运行状态和 `last_seen`；不能改 Task 状态 |
+| `project_get_state` | Orchestrator | `project_id`, `agent_id` | 返回本项目 Agent、Task、Submission 的当前列表及最近 Event |
+| `task_create` | Orchestrator | `project_id`, `agent_id`, `title`, `description?` | 创建 `pending` Task，返回 `task_id` 与 `version=1` |
+| `task_assign` | Orchestrator | `project_id`, `agent_id`, `task_id`, `assignee_agent_id`, `expected_version` | 把 `pending` Task 分配给已登记 Worker，进入 `assigned` |
+| `task_get_assignment` | Worker | `project_id`, `agent_id` | 返回当前分配给自己的未完成 Task 列表，可轮询；无任务时返回空列表 |
+| `task_get` | Orchestrator 或该 Task 的执行 Worker | `project_id`, `agent_id`, `task_id` | 返回 Task、版本、最近报告和 Submission |
+| `task_report` | 当前执行 Worker | `project_id`, `agent_id`, `task_id`, `kind`, `progress?`, `message?`, `expected_version` | `kind` 为 `working`、`progress`、`blocked`；记录报告，按下述固定状态机更新 |
+| `submission_create` | 当前执行 Worker | `project_id`, `agent_id`, `task_id`, `summary`, `result_ref?`, `expected_version` | 原子创建 `pending` Submission，Task 进入 `submitted` |
+| `submission_review` | Orchestrator | `project_id`, `agent_id`, `submission_id`, `decision`, `feedback?`, `expected_version` | `approve` 原子完成 Task；`reject` 附反馈并使 Task 回到 `working` |
 
-### Orchestrator
+MVP 不提供通用 `task_update`、`task_complete`、依赖管理、任务重开、取消或失败接口。Worker 不能直接把 Task 标为 `completed`，也不能批准 Submission。
 
-唯一任务编排者。
+## 状态与权限
 
-### Worker Agent
+| 原状态 | 操作 | 新状态 |
+| --- | --- | --- |
+| 不存在 | Orchestrator `task_create` | `pending` |
+| `pending` | Orchestrator `task_assign` | `assigned` |
+| `assigned`、`blocked` | 当前 Worker `task_report(kind=working)` | `working` |
+| `assigned`、`working` | 当前 Worker `task_report(kind=blocked)` | `blocked` |
+| `assigned`、`working`、`blocked` | 当前 Worker `task_report(kind=progress)` | 不变 |
+| `working` | 当前 Worker `submission_create` | `submitted` |
+| `submitted` | Orchestrator `submission_review(approve)` | `completed` |
+| `submitted` | Orchestrator `submission_review(reject)` | `working` |
 
-任务执行者。
+其他转换均返回 `INVALID_TRANSITION`。`completed` 为终态。一个 Task 同时最多一个 `pending` Submission。拒绝后保留历史 Submission，Worker 可再次提交。只有当前 `assigned_agent_id` 能读该 Task、报告和提交；Orchestrator 可读本项目全部状态。ProjectDO 是这些规则的最终检查点。
 
-## Functional Requirements
+## 数据与一致性
 
-### FR-001 Agent Registration
-系统必须允许 Agent 注册到指定 Project。
+- Project: `project_id`, `orchestrator_agent_id`, `created_at`。
+- Agent: `agent_id`, `role` (`orchestrator|worker`), `status` (`idle|working|waiting|blocked|error`), `current_task_id?`, `last_seen`, `version`。
+- Task: `task_id`, `title`, `description`, `status`, `assigned_agent_id?`, `progress`, `message?`, `version`, `created_at`, `updated_at`。
+- Submission: `submission_id`, `task_id`, `agent_id`, `status` (`pending|approved|rejected`), `summary`, `result_ref?`, `feedback?`, `created_at`, `reviewed_at?`。
+- Event: 项目内递增 `seq`、`type`、`entity_id`、`actor_agent_id`、`payload`、`created_at`。Event 只用于审计；当前状态来自领域表。
 
-### FR-002 Heartbeat
-Agent 必须能够更新自身 last_seen 和运行状态。
+Task 创建时 `version=1`，每次 Task 持久化修改后加 1。更新 Task 的工具必须提供 `expected_version`；不匹配返回 `VERSION_CONFLICT` 和当前版本，不执行写入。`submission_create` 与 `submission_review` 的实体修改、版本递增和 Event 追加必须在同一 SQLite 事务中完成。成功的状态变化及报告均追加 Event。MVP 不要求请求幂等键，客户端在网络错误后须重新读取状态再决定是否重试。
 
-### FR-003 Task Creation
-只有 Orchestrator 可以创建 Task。
+## 技术边界与验收
 
-### FR-004 Task Assignment
-只有 Orchestrator 可以分配 Task。
+- 使用 Cloudflare Worker、一个 Project 对应一个 ProjectDO、DO SQLite；不引入 Redis、D1、Queue、WebSocket、Alarm 或外部数据库。
+- MCP 采用无会话 Streamable HTTP。Worker 不保存业务状态；内部调用 ProjectDO 的方法。
+- 领域规则可离线测试；DO 层测试事务、版本冲突和数据持久化；MCP 测试工具发现与完整调用链。
+- 验收链路：初始化项目 → 注册 Orchestrator 和 Worker → 创建并分配 Task → Worker 查询自己的 Assignment、汇报 working 和 progress → 创建 Submission → Orchestrator 查询并 approve → Task completed → Event 能追踪全过程。
+- 负例：第二个 Orchestrator、Worker 创建或分配 Task、非 assignee 提交、Worker 审核、过期版本、非法状态转换必须被拒绝；reject 后 Worker 可读取反馈并再次提交。
 
-### FR-005 Assignment Query
-Worker Agent 可以获取自己的当前 Assignment。
+## 后续迭代
 
-### FR-006 Task Context
-Agent 可以读取其有权限访问的 Task 上下文。
-
-### FR-007 Progress Reporting
-Worker Agent 可以汇报 progress 和 message。
-
-### FR-008 Blocker Reporting
-Worker Agent 可以报告 blocker。
-
-### FR-009 Submission
-Worker Agent 可以提交工作成果，但不能直接完成 Task。
-
-### FR-010 Submission Review
-只有 Orchestrator 可以 approve / reject Submission。
-
-### FR-011 Task Completion
-只有 Orchestrator 可以将 Task 设置为 completed。
-
-### FR-012 Dependency
-Orchestrator 可以建立和移除 Task dependency。
-
-### FR-013 Event Trace
-关键业务动作必须生成 Event。
-
-### FR-014 Version Check
-关键更新必须支持 expected_version。
-
-### FR-015 Project State
-系统必须支持创建 Project，并让 Orchestrator 查询项目内的 Agent、Task、Submission 和依赖状态。一个 Project 对应一个 ProjectDO；该对象负责最终权限校验、状态更新、版本递增和 Event 记录。
-
-### FR-016 Agent Context
-Agent 必须能读取自身运行状态、当前任务及其进度和 version、任务相关 Agent、依赖任务及其状态、当前阻塞。Worker 仅能读取有权限访问的上下文，不暴露底层存储结构。
-
-### FR-017 Task Lifecycle
-MVP Task 状态为 pending、assigned、working、submitted、completed、blocked、failed、cancelled。状态变化必须符合领域状态机并增加 Task version。Worker 的进度和阻塞是事实汇报，不构成任意修改权威生命周期的权限；Orchestrator 决定正式状态和后续流转。
-
-### FR-018 Submission Flow
-被分配的 Worker 提交包含成果摘要（可附结果引用）的 Submission 后，ProjectDO 按领域规则使 Task 进入 submitted，等待 Orchestrator 审核。Submission 状态为 pending、approved、rejected；只有 Orchestrator 能审核。approve 后 Task 才能 completed；reject 后 Worker 应能读取审核反馈并继续执行。
-
-### FR-019 Presence
-Agent 的运行状态包括 idle、working、waiting、blocked、offline、error。heartbeat 更新自身 last_seen、运行状态及可选的当前任务、进度和消息；读取时另根据 last_seen 和可配置阈值计算在线、可疑、离线判定，不把推断结果当成 Agent 主动上报。MVP 不依赖定时 Alarm 扫描。建议发送间隔为 10~15 秒，判定阈值分别为 30 秒和 90 秒。
-
-### FR-020 Task Relationships
-Task 可以记录 owner、assignee、parent 及 dependency；Orchestrator 管理分配和依赖。未完成的前置任务不应被 Orchestrator 视为满足执行条件。MVP 不要求自动 DAG 调度或自动能力匹配。
-
-### FR-021 Access Control
-MVP 角色仅为 orchestrator 和 worker。Worker 只能读取授权任务、更新自身运行状态、汇报和提交；不能创建、分配、重开、取消或完成 Task，也不能管理依赖或审核 Submission。所有操作由 ProjectDO 根据调用身份再次校验，不能仅依赖 Prompt、Skill 或 MCP 入口。
-
-### FR-022 Event History
-关键状态变化必须写入可查询的 Event，记录动作类型、实体、操作者、时间和相关数据，使 MVP 协作链路可追踪。当前状态从领域数据读取，Event 不作为当前状态源。
-
-### FR-023 Collaboration API
-Worker 工具覆盖注册、heartbeat、上下文和分配查询、进度与阻塞汇报、Submission 创建与查询；Orchestrator 工具覆盖项目状态、Agent 查询、Task 创建/分配/更新/依赖/重开/完成/取消、Submission 列表与审核。MCP 仅暴露协作语义，不暴露 SQL、Storage 或内部 RPC。
-
-## Non-Functional Requirements
-
-### NFR-001
-单 Project 支持少于 10 个 Agent。
-
-### NFR-002
-ProjectDO 是 Project 状态唯一权威源。
-
-### NFR-003
-第一版不得依赖 Redis、Kafka、Temporal、D1。
-
-### NFR-004
-领域层必须与 Cloudflare API 解耦。
-
-### NFR-005
-所有权限与状态转换必须具备自动化测试。
-
-### NFR-006
-Worker 作为无状态 HTTP/MCP 入口，负责鉴权、身份与 Project 解析、参数校验、路由、统一错误映射和请求追踪；内部优先通过 Typed RPC 调用 ProjectDO。
-
-### NFR-007
-MVP 使用 SQLite-backed Durable Object Storage 和 HTTP/MCP + heartbeat；不引入外部协调服务、分布式锁或 WebSocket Push。
-
-### NFR-008
-Task 与 Agent 保留 version。携带过期 expected_version 的关键更新必须返回 VERSION_CONFLICT，调用方重新读取上下文后再决定动作。
-
-## MVP Acceptance
-
-完整链路：创建 Project，注册 Orchestrator 与 Worker，创建并分配 Task，Worker 获取 Assignment 和 Task Context、发送 heartbeat、汇报进度、创建 Submission，Task 进入 submitted，Orchestrator 查询并 approve，Task 进入 completed，Event 可还原关键过程。
-
-必须验证：Worker 直接完成 Task 或修改其他 Agent 状态返回 PERMISSION_DENIED；Worker 无法审核自己的 Submission；过期 expected_version 返回 VERSION_CONFLICT；拒绝 Submission 后可读取反馈并继续执行。
-
-## Out of Scope
-
-- Multi-Orchestrator
-- 跨 Project Workflow
-- 自动调度优化
-- 高级 DAG Scheduler
-- WebSocket Push
-- 长期 Agent Memory
-- Artifact Repository
-- Leader Election、Redis/Queue、分布式锁和自动任务抢占
-- 自动 capability matching、高级 RBAC、BI 与全局搜索
-- 高频 Alarm 在线扫描
+凭据与身份验证、依赖、更多 Task 状态、事件分页、Agent presence 阈值、幂等键和完整工具集按需求另行决定。新增架构能力先记录 ADR。
